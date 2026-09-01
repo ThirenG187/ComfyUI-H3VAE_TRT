@@ -572,7 +572,11 @@ class MiniMaxH3TRTCompilerNode:
         logger = trt.Logger(trt.Logger.INFO)
         builder = trt.Builder(logger)
         config = builder.create_builder_config()
-        network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+        if hasattr(trt.NetworkDefinitionCreationFlag, "EXPLICIT_BATCH"):
+            flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+            network = builder.create_network(flags)
+        else:
+            network = builder.create_network()
         parser = trt.OnnxParser(network, logger)
         
         if not parser.parse_from_file(onnx_path):
