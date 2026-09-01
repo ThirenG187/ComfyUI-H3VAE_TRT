@@ -3,6 +3,7 @@ import math
 import logging
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import folder_paths
 import comfy.cli_args
@@ -14,12 +15,6 @@ try:
     HAS_TRT = True
 except ImportError:
     HAS_TRT = False
-
-try:
-    import onnxruntime as ort
-    HAS_ORT = True
-except ImportError:
-    HAS_ORT = False
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +50,6 @@ if not hasattr(mm, "_minimax_trt_hook_applied"):
 class AutoEngineRunner:
     def __init__(self, model_path: str):
         self.model_path = model_path
-        self.is_engine = model_path.endswith(".engine")
         self.stream = None
         self.engine_bytes = None
         self.runtime = None
@@ -65,7 +59,7 @@ class AutoEngineRunner:
         ACTIVE_TRT_RUNNERS.add(self)
 
     def load_to_ram(self):
-        if self.engine_bytes is None and self.is_engine:
+        if self.engine_bytes is None:
             with open(self.model_path, "rb") as f:
                 self.engine_bytes = f.read()
 
@@ -73,20 +67,14 @@ class AutoEngineRunner:
         if self.context is not None or self.session is not None:
             return
 
-        if self.is_engine:
-            self.load_to_ram()
-            if not HAS_TRT:
-                raise RuntimeError("TensorRT library not found!")
-            if self.runtime is None:
-                self.runtime = trt.Runtime(trt.Logger(trt.Logger.WARNING))
-            self.engine = self.runtime.deserialize_cuda_engine(self.engine_bytes)
-            self.context = self.engine.create_execution_context()
-            self.stream = torch.cuda.Stream()
-        else:
-            if not HAS_ORT:
-                raise RuntimeError("onnxruntime-gpu library not found!")
-            providers = ["CUDAExecutionProvider"]
-            self.session = ort.InferenceSession(self.model_path, providers=providers)
+        self.load_to_ram()
+        if not HAS_TRT:
+            raise RuntimeError("TensorRT library not found!")
+        if self.runtime is None:
+            self.runtime = trt.Runtime(trt.Logger(trt.Logger.WARNING))
+        self.engine = self.runtime.deserialize_cuda_engine(self.engine_bytes)
+        self.context = self.engine.create_execution_context()
+        self.stream = torch.cuda.Stream()
 
     def offload_to_ram(self):
         if self.context is not None:
@@ -106,28 +94,22 @@ class AutoEngineRunner:
         dtype = input_tensor.dtype
         input_tensor = input_tensor.contiguous()
         
-        if self.is_engine:
-            if self.stream is None or self.stream.device != device:
-                self.stream = torch.cuda.Stream(device=device)
-                
-            self.stream.wait_stream(torch.cuda.current_stream(device))
+        if self.stream is None or self.stream.device != device:
+            self.stream = torch.cuda.Stream(device=device)
             
-            # 分配输出张量内存（用 zeros 避免未初始化脏显存泄露）
-            output = torch.zeros(output_shape, dtype=dtype, device=device)
-            self.context.set_input_shape(input_name, input_tensor.shape)
-            self.context.set_tensor_address(input_name, input_tensor.data_ptr())
-            out_name = "pixel_tile" if input_name == "latent_tile" else "moments_tile"
-            self.context.set_tensor_address(out_name, output.data_ptr())
-            
-            # 🌟 传入非默认独立流，彻底消除 TensorRT 的 enqueueV3() 性能警告
-            self.context.execute_async_v3(self.stream.cuda_stream)
-            self.stream.synchronize()
-            return output
-        else:
-            # ONNX Runtime CPU/GPU 回退通道
-            inp_np = input_tensor.detach().cpu().numpy()
-            out_np = self.session.run(None, {input_name: inp_np})[0]
-            return torch.from_numpy(out_np).to(device=device, dtype=dtype)
+        self.stream.wait_stream(torch.cuda.current_stream(device))
+        
+        # 分配输出张量内存（用 zeros 避免未初始化脏显存泄露）
+        output = torch.zeros(output_shape, dtype=dtype, device=device)
+        self.context.set_input_shape(input_name, input_tensor.shape)
+        self.context.set_tensor_address(input_name, input_tensor.data_ptr())
+        out_name = "pixel_tile" if input_name == "latent_tile" else "moments_tile"
+        self.context.set_tensor_address(out_name, output.data_ptr())
+        
+        # 🌟 传入非默认独立流，彻底消除 TensorRT 的 enqueueV3() 性能警告
+        self.context.execute_async_v3(self.stream.cuda_stream)
+        self.stream.synchronize()
+        return output
 
     def __del__(self):
         ACTIVE_TRT_RUNNERS.discard(self)
@@ -235,9 +217,22 @@ class MiniMaxH3AcceleratedVAE(nn.Module):
         return self.decoder_runner.infer(z, output_shape=out_shape, input_name="latent_tile")
 
     def _encode_moments(self, x):
-        b, _, t, h, w = x.shape
-        out_shape = (b, 48, math.ceil(t / self.vae_ratio_t), h // self.vae_ratio, w // self.vae_ratio)
-        return self.encoder_runner.infer(x, output_shape=out_shape, input_name="pixel_tile")
+        b, c, t, h, w = x.shape
+        target_h, target_w = self.tile_size, self.tile_size
+        pad_h = max(0, target_h - h)
+        pad_w = max(0, target_w - w)
+        
+        if pad_h > 0 or pad_w > 0:
+            x_in = F.pad(x, (0, pad_w, 0, pad_h, 0, 0), mode="constant", value=0.0)
+        else:
+            x_in = x
+            
+        out_shape = (b, 48, math.ceil(t / self.vae_ratio_t), target_h // self.vae_ratio, target_w // self.vae_ratio,)
+        moments = self.encoder_runner.infer(x_in, output_shape=out_shape, input_name="pixel_tile")
+        
+        out_h = math.ceil(h / self.vae_ratio)
+        out_w = math.ceil(w / self.vae_ratio)
+        return moments[..., :out_h, :out_w]
 
     def _finalize_pixels(self, part):
         return (part * self.pixel_std.to(part) + self.pixel_mean.to(part)).clamp(0.0, 1.0)
@@ -433,7 +428,7 @@ class MiniMaxH3AcceleratedVAE(nn.Module):
 
 class ComfyVAEWrapper:
     def __init__(self, first_stage_model):
-        self.onnx = True
+        self.trt = True
         self.first_stage_model = first_stage_model
 
     def decode(self, samples_in):
@@ -455,46 +450,6 @@ class ComfyVAEWrapper:
         latents = self.first_stage_model.encode(x.half().cuda())
         return latents.float().cpu()
 
-
-class MiniMaxH3ONNXVAELoader:
-    @classmethod
-    def INPUT_TYPES(s):
-        files = []
-        for path in folder_paths.get_folder_paths("vae"):
-            for root, _, fs in os.walk(path):
-                for f in fs:
-                    if f.endswith(".onnx"):
-                        files.append(os.path.relpath(os.path.join(root, f), path))
-        files = sorted(list(dict.fromkeys(files)))
-        options = ["None"] + files
-
-        return {
-            "required": {
-                "decoder": (options,),
-                "encoder": (options,),
-            }
-        }
-
-    RETURN_TYPES = ("VAE",)
-    RETURN_NAMES = ("VAE",)
-    FUNCTION = "load_vae"
-    CATEGORY = "MiniMax_H3/Acceleration"
-
-    def load_vae(self, decoder, encoder):
-        if encoder == "None":
-            raise RuntimeError("Encoder cannot be None!")
-        if decoder == "None":
-            raise RuntimeError("Decoder cannot be None!")
-
-        dec_path = folder_paths.get_full_path("vae", decoder)
-        enc_path = folder_paths.get_full_path("vae", encoder)
-
-        dec_runner = AutoEngineRunner(dec_path) if dec_path else None
-        enc_runner = AutoEngineRunner(enc_path) if enc_path else None
-
-        vae_instance = MiniMaxH3AcceleratedVAE(decoder_runner=dec_runner, encoder_runner=enc_runner)
-        return (ComfyVAEWrapper(vae_instance),)
-
 class MiniMaxH3TRTVAELoader:
     @classmethod
     def INPUT_TYPES(s):
@@ -509,8 +464,14 @@ class MiniMaxH3TRTVAELoader:
         
         return {
             "required": {
-                "decoder": (options,),
-                "encoder": (options,),
+                "decoder": (options, {
+                    "default": "None",
+                    "tooltip": 'Please compile the TensorRT engine using the "MiniMax-H3 TRT VAE Compiler" node before first use.'
+                }),
+                "encoder": (options, {
+                    "default": "None",
+                    "tooltip": 'Please compile the TensorRT engine using the "MiniMax-H3 TRT VAE Compiler" node before first use.'
+                }),
             }
         }
     
@@ -518,6 +479,7 @@ class MiniMaxH3TRTVAELoader:
     RETURN_NAMES = ("VAE",)
     FUNCTION = "load_vae"
     CATEGORY = "MiniMax_H3/Acceleration"
+    DESCRIPTION = 'Please compile the TensorRT engine using the "MiniMax-H3 TRT VAE Compiler" node before first use.'
     
     def load_vae(self, decoder, encoder):
         if encoder == "None":
@@ -550,6 +512,10 @@ class MiniMaxH3TRTCompilerNode:
             "required": {
                 "decoder_onnx": (options,),
                 "encoder_onnx": (options,),
+                "delete_onnx_after_compile": ("BOOLEAN",{
+                    "default": False,
+                    "tooltip": "Delete ONNX weights from disk after compilation."
+                }),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -563,35 +529,39 @@ class MiniMaxH3TRTCompilerNode:
     
     @classmethod
     def _build_engine(cls, onnx_path, engine_path, is_decoder=True):
-        if not HAS_ORT:
-            raise RuntimeError("onnxruntime-gpu library not found! Please install with pip first.")
-            
         if not HAS_TRT:
             raise RuntimeError("TensorRT library not found! Please install with pip first.")
             
         logger = trt.Logger(trt.Logger.INFO)
         builder = trt.Builder(logger)
         config = builder.create_builder_config()
+        
+        # 🌟 兼容 TRT 8.x / 10.x / 11.x 的 Network 创建
         if hasattr(trt.NetworkDefinitionCreationFlag, "EXPLICIT_BATCH"):
             flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
             network = builder.create_network(flags)
         else:
             network = builder.create_network()
+            
         parser = trt.OnnxParser(network, logger)
         
+        # 🌟 使用 parse_from_file，确保正确读取同目录下的 .onnx.data
         if not parser.parse_from_file(onnx_path):
             error_msgs = []
             for error in range(parser.num_errors):
                 error_msgs.append(str(parser.get_error(error)))
             raise RuntimeError("Failed to parse ONNX:\n" + "\n".join(error_msgs))
-                
-        # 启用 FP16 模式
-        config.set_flag(trt.BuilderFlag.FP16)
-        
+            
+        # 🌟 兼容 TRT 8.x ~ 10.x（TRT 11.x 彻底删除了 FP16 弱类型 Flag）
+        if hasattr(trt.BuilderFlag, "FP16"):
+            config.set_flag(trt.BuilderFlag.FP16)
+            
         # 设置工作区显存 (Decoder 分配 4GB, Encoder 分配 8GB)
-        workspace_size = (4 if is_decoder else 8) * (1024 ** 3)
+        workspace_size = (4 if is_decoder else 8) * (1024**3)
         if hasattr(config, "set_memory_pool_limit"):
-            config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_size)
+            config.set_memory_pool_limit(
+                    trt.MemoryPoolType.WORKSPACE, workspace_size
+            )
         else:
             config.max_workspace_size = workspace_size
             
@@ -611,17 +581,17 @@ class MiniMaxH3TRTCompilerNode:
         if hasattr(builder, "build_serialized_network"):
             serialized_engine = builder.build_serialized_network(network, config)
             if serialized_engine is None:
-                raise RuntimeError("Failed to build the TensorRT engine.！")
+                raise RuntimeError("Failed to build the TensorRT engine!")
             with open(engine_path, "wb") as f:
                 f.write(serialized_engine)
         else:
             engine = builder.build_engine(network, config)
             if engine is None:
-                raise RuntimeError("Failed to build the TensorRT engine.！")
+                raise RuntimeError("Failed to build the TensorRT engine!")
             with open(engine_path, "wb") as f:
                 f.write(engine.serialize())
                 
-    def compile_models(self, decoder_onnx, encoder_onnx, unique_id):
+    def compile_models(self, decoder_onnx, encoder_onnx, delete_onnx_after_compile, unique_id):
         dec_path = folder_paths.get_full_path("vae", decoder_onnx)
         enc_path = folder_paths.get_full_path("vae", encoder_onnx)
         
@@ -639,6 +609,8 @@ class MiniMaxH3TRTCompilerNode:
             logger.info(f"Building Decoder: {os.path.basename(dec_path)}...")
             self._build_engine(dec_path, engine_path, is_decoder=True)
             logger.info(f"✅ Done: {os.path.basename(engine_path)}")
+            if delete_onnx_after_compile:
+                os.remove(dec_path)
             
         # 3. 编译 Encoder
         if enc_path is not None:
@@ -646,8 +618,10 @@ class MiniMaxH3TRTCompilerNode:
             logger.info(f"Building Encoder: {os.path.basename(enc_path)}...")
             self._build_engine(enc_path, engine_path, is_decoder=False)
             logger.info(f"✅ Done: {os.path.basename(engine_path)}")
+            if delete_onnx_after_compile:
+                os.remove(enc_path)
             
         # 4. 完成提示
         logger.info('🎉 All Done! Please press "R" to refresh the model list.')
-        PromptServer.instance.send_progress_text('🎉 Done! Press "R" key to refresh the model list.', unique_id)
+        PromptServer.instance.send_progress_text('Done! Press "R" to refresh the model list.', unique_id)
         return ()

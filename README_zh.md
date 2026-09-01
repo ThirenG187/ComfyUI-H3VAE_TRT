@@ -1,6 +1,6 @@
 # ComfyUI-H3VAE_TRT
 
-在 ComfyUI 中运行 MiniMax-H3 VAE 的 ONNX/TRT 版本，最高可提升约 1.7 倍的编解码速度
+在 ComfyUI 中运行 MiniMax-H3 VAE 的 TensorRT 版本，最高可提升约 1.7 倍的编解码速度
 
 ## 预览
 
@@ -25,7 +25,7 @@ python -m pip install -r ComfyUI-H3VAE_TRT/requirements.txt
 
 ### 节点
 
-- 你可以直接运行 ONNX 模型，但通常速度较慢。推荐使用 `MiniMax-H3 TRT Compiler` 节点将 ONNX 模型编译为 TRT 引擎。
+- 在首次使用前请先通过 `MiniMax-H3 TRT Compiler` 节点将 ONNX 模型编译为 TensorRT 引擎。
 - 成功编译 TRT Engine 后，就可以使用 `MiniMax-H3 TRT VAE Loader` 节点加载它们了。
 
 ## 致谢
